@@ -1,23 +1,52 @@
 # drusql
 
-SQL 模板引擎：把带 `{{ }}` 占位符的模板编译成“SQL 文本 + 绑定参数列表”，支持 MySQL、PostgreSQL、Oracle、SQL Server。
+English | [简体中文](README.zh-CN.md)
 
-- 请求里的值一律走参数绑定，不拼入 SQL 文本
-- 5 类标签：值占位符、`if`、`for`、`validate`、`set`
-- 变量路径采用 JSONPath，表达式写法参考 Twig，校验规则参考 Laravel
-- 零依赖，只用标准库；解析后的模板可并发执行
+drusql is a SQL template engine for Go. It compiles a template with `{{ }}` placeholders into SQL text plus a list of bound arguments, for MySQL, PostgreSQL, Oracle and SQL Server.
+
+- **Safe**: request values are always bound as parameters, never concatenated into the SQL text
+- **Small**: five kinds of tags — value placeholders, `if`, `for`, `validate`, `set`
+- **Familiar**: JSONPath for variables, Twig-style expressions, Laravel-style validation rules
+- **Light**: no dependencies beyond the standard library; parsed templates are safe for concurrent use
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [How execution works](#how-execution-works)
+- [Go API](#go-api)
+- [Template syntax](#template-syntax)
+- [Writing conventions](#writing-conventions)
+- [Recipes](#recipes)
+- [Error handling](#error-handling)
+- [Notes](#notes)
+- [License](#license)
+
+## Install
 
 ```
 go get github.com/qq1060656096/drusql
 ```
 
-## 快速开始
+Requires Go 1.21 or later.
+
+## Quick start
 
 ```go
-eng := drusql.New(drusql.MySQL) // 或 PostgreSQL / Oracle / SQLServer
+package main
 
-tpl, err := eng.Parse(`
-{{validate $.request.body.ids rule="array|max:100" message="最多100个id"}}
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/qq1060656096/drusql"
+)
+
+// Parse a template once; it can then be executed concurrently.
+var eng = drusql.New(drusql.MySQL) // or PostgreSQL / Oracle / SQLServer
+
+var listUsers = eng.MustParse(`{{validate $.request.body.ids rule="array|max:100" message="at most 100 ids"}}
 select * from users
 where 1=1
 {{if notIsEmpty($.request.body.name)}}
@@ -27,37 +56,85 @@ where 1=1
   and id in ({{$.request.body.ids|join(",")}})
 {{/if}}
 order by {{$.request.body.sort|default("id")|ident("id,created_at")}} desc`)
-if err != nil {
-    // *drusql.ParseError：语法错误、未知函数等，带行列号
-}
 
-res, err := tpl.Exec(drusql.Request(body, header)) // body、header 是解码后的 JSON 或任意 Go 值
-var verrs drusql.ValidationErrors
-switch {
-case errors.As(err, &verrs):
-    // 校验失败，返回给前端：json.Marshal(map[string]any{"errors": verrs})
-case err != nil:
-    // *drusql.ExecError：与请求数据有关的执行期错误
-default:
-    rows, err := db.Query(res.SQL, res.Args...)
+func main() {
+	var body map[string]any
+	_ = json.Unmarshal([]byte(`{"name": " Tom ", "ids": [1, 2, 3]}`), &body)
+
+	res, err := listUsers.Exec(drusql.Request(body, nil))
+
+	var verrs drusql.ValidationErrors
+	switch {
+	case errors.As(err, &verrs):
+		// Validation failed: send verrs back to the client.
+		out, _ := json.Marshal(map[string]any{"errors": verrs})
+		fmt.Println(string(out))
+	case err != nil:
+		// Any other execution error.
+		fmt.Println(err)
+	default:
+		fmt.Println(res.SQL)
+		fmt.Println(res.Args...)
+		// rows, err := db.Query(res.SQL, res.Args...)
+	}
 }
 ```
 
-上面的模板在 `{"name": " Tom ", "ids": [1,2,3]}` 下得到：
+Output:
 
-```sql
+```
 select * from users
 where 1=1
   and name like ? escape '!'
   and id in (?,?,?)
 order by id desc
+%Tom% 1 2 3
 ```
 
-参数为 `["%Tom%", 1, 2, 3]`。换成 PostgreSQL 占位符是 `$1…$4`，Oracle 是 `:1…:4`，SQL Server 是 `@p1…@p4`。
+The same template works for every dialect. Only the placeholder form changes; the arguments are identical.
 
-## 语法
+| Dialect | Placeholder | The `in` list above |
+| --- | --- | --- |
+| `drusql.MySQL` | `?` | `in (?,?,?)` |
+| `drusql.PostgreSQL` | `$n` | `in ($2,$3,$4)` |
+| `drusql.Oracle` | `:n` | `in (:2,:3,:4)` |
+| `drusql.SQLServer` | `@pn` | `in (@p2,@p3,@p4)` |
 
-### 值占位符
+## How execution works
+
+`Exec` runs in two steps:
+
+1. Top-level `set` and `validate` tags run in the order they are written. A failed validation does not stop the run; all failures are collected.
+2. If anything failed, `Exec` returns `ValidationErrors` and renders no SQL. Otherwise it renders the SQL and returns `Result{SQL, Args}`.
+
+A `validate` tag therefore takes effect before the SQL, wherever it sits in the template.
+
+## Go API
+
+| API | Description |
+| --- | --- |
+| `drusql.New(dialect) *Engine` | Creates an engine. Dialects: `MySQL`, `PostgreSQL`, `Oracle`, `SQLServer` |
+| `(*Engine).Parse(src) (*Template, error)` | Parses a template. Errors are `*ParseError` with line and column |
+| `(*Engine).MustParse(src) *Template` | Like `Parse` but panics on error; handy for package-level templates |
+| `(*Engine).RegisterFunc(name, minArgs, maxArgs, fn) error` | Registers a custom function. Call it before `Parse` |
+| `(*Template).Exec(data) (*Result, error)` | Executes the template and returns `Result{SQL string, Args []any}` |
+| `(*Template).Validate(data) (ValidationErrors, error)` | Runs validation only, without rendering SQL |
+| `drusql.Request(body, header) map[string]any` | Builds the root data `{"request": {"body": ..., "header": ...}}` |
+| `drusql.Undefined` | The value of a path that does not exist; custom functions can test for it |
+
+`data` is the root object `$` of the template. `body` and `header` can be decoded JSON or any Go value (maps, slices, structs; struct fields are addressed by their `json` tag). The input is never modified.
+
+You can put more than `request` into the root object and read it as `$.xxx`:
+
+```go
+data := drusql.Request(body, header)
+data["tenant"] = map[string]any{"id": 42}
+// template: where tenant_id = {{$.tenant.id}}
+```
+
+## Template syntax
+
+### Value placeholders
 
 ```
 {{$.request.body.name}}
@@ -65,127 +142,378 @@ order by id desc
 {{$.request.body.ids|join(",")}}
 ```
 
-输出一个参数占位符并绑定求值结果。结果是 `undefined`（路径不存在）时报错，需要先经过 `default`；结果是 `null` 时绑定 NULL。
+- Emits one parameter placeholder and appends the evaluated value to the argument list.
+- An `undefined` result (the path does not exist) is an error; pass it through `default` first.
+- A `null` result binds NULL. Remember that `col = NULL` is never true; use `if isNull(...)` and write `col is null`.
+- An array cannot be bound directly; expand it with `join` or `for`.
 
-### 变量路径（JSONPath）
+### Variable paths (JSONPath)
 
-| 写法 | 含义 |
+| Syntax | Meaning |
 | --- | --- |
-| `$.request.body.name`、`$.request.body['X-Key']` | 取成员 |
-| `$.request.body.users[0].id`、`[-1]` | 取下标 |
-| `$.request.body.users[*].user_id` | 全部元素 |
-| `$.request.body.ids[0:10]`、`[::2]` | 切片 |
-| `$.request.body.users[?@.type == 1 && @.age > 18]` | 过滤 |
-| `$..user_id` | 递归查找 |
-| `$v`、`$v.user_id` | 循环变量（对 JSONPath 的扩展） |
+| `$.request.body.name`, `$.request.body['X-Key']` | Member access |
+| `$.request.body.users[0].id`, `[-1]` | Index; negative counts from the end |
+| `$.request.body.users[*].user_id` | All elements |
+| `$.request.body.ids[0:10]`, `[::2]` | Slice |
+| `$.request.body.users[?@.type == 1 && @.age > 18]` | Filter; `@` is the current element |
+| `$..user_id` | Recursive descent |
+| `$v`, `$v.user_id` | Loop variable (an extension to JSONPath) |
 
-只含成员和下标的路径返回单个值，不存在时为 `undefined`；含 `[*]`、切片、过滤或 `..` 的路径始终返回数组。过滤表达式不支持 RFC 9535 的函数扩展（`length()`、`match()` 等）。
+- A path made only of members and indexes returns a **single value**, or `undefined` if it does not exist.
+- A path with `[*]`, a slice, a filter or `..` **always returns an array**, empty when nothing matches.
+- Filter expressions do not support the RFC 9535 function extensions (`length()`, `match()` and so on).
 
-### 函数与管道
+### Functions and pipes
 
-`x|f(a)` 等价于 `f(x, a)`。
+A pipe is a function call: `x|f(a)` is the same as `f(x, a)`, and the parentheses can be dropped when there are no extra arguments. Function names are case-sensitive.
 
-| 函数 | 作用 |
+| Function | What it does |
 | --- | --- |
-| `default(x, v)` | `isEmpty(x)` 时取 `v` |
-| `trim` `lower` `upper` `length` | 字符串处理；`length` 也可取数组长度 |
-| `int` `float` `string` `bool` `date(x, "Y-m-d")` | 类型转换，失败报错 |
-| `join(x, ",")` | 数组展开为多个绑定参数，必须在管道链末尾 |
-| `like` `likeLeft` `likeRight` | 转义通配符后绑定 `%值%` / `%值` / `值%`，转义符为 `!`，模板里配套写 `escape '!'` |
-| `ident(x, "a,b,c")` | 值在白名单内则作为标识符拼入 SQL，否则报错 |
-| `raw(x)` | 原样拼入 SQL，不绑定，安全性由模板作者负责 |
-| `isDefined` `isNull` `isEmpty` `notIsEmpty` | 判断；`isEmpty` 对未定义、null、`""`、`[]` 为真，`0` 和 `"0"` 不算空；`notIsEmpty` 是它的取反 |
-| `t(key)` | 多语言文案 |
+| `default(x, v)` | Returns `v` when `isEmpty(x)` is true |
+| `trim(x)` `lower(x)` `upper(x)` | String helpers; non-strings pass through unchanged |
+| `length(x)` | Character count of a string or element count of an array; 0 for `undefined` and `null` |
+| `int(x)` `float(x)` `string(x)` `bool(x)` | Type conversion; fails with an error if the value cannot be converted |
+| `date(x, "Y-m-d H:i:s")` | Formats a date using PHP / Twig format characters `Y y m n d j H i s` |
+| `join(x, ",")` | Expands an array into several bound parameters; must be last in the pipe chain, and the separator must be a literal |
+| `like(x)` `likeLeft(x)` `likeRight(x)` | Escapes wildcards and binds `%value%` / `%value` / `value%` |
+| `ident(x, "a,b,c")` | Writes the value into the SQL as an identifier if it is in the whitelist, otherwise fails; the whitelist must be a literal |
+| `raw(x)` | Writes the value into the SQL as is, unbound; the template author is responsible for its safety |
+| `isDefined(x)` | The path exists (a null value counts as existing) |
+| `isNull(x)` | The path exists and its value is null |
+| `isEmpty(x)` | Undefined, null, empty string or empty array; `0`, `"0"` and `false` are not empty |
+| `notIsEmpty(x)` | The negation of `isEmpty(x)` |
+| `t(key)` | Localized message, see below |
 
-自定义函数：
+Only `ident` and `raw` change the SQL text. Every other function only changes the bound value.
+
+The `like` family uses `!` as the escape character, so write `escape '!'` next to it:
+
+```
+name like {{$.request.body.kw|like}} escape '!'
+```
+
+Custom functions:
 
 ```go
-eng.RegisterFunc("mask", 1, 1, func(args []any) (any, error) { ... }) // 在 Parse 之前注册
+eng := drusql.New(drusql.MySQL)
+err := eng.RegisterFunc("mask", 1, 1, func(args []any) (any, error) {
+	s, ok := args[0].(string)
+	if !ok {
+		return args[0], nil // pass Undefined, nil etc. through
+	}
+	if len(s) <= 3 {
+		return s, nil
+	}
+	return s[:3] + "****", nil
+})
+// template: {{$.request.body.phone|mask}} or {{mask($.request.body.phone)}}
 ```
 
-### 表达式
+### Expressions
 
-- 逻辑：`and` / `&&`、`or` / `||`、`not` / `!`
-- 比较：`==` `!=` `>` `>=` `<` `<=`
-- 算术：`+` `-` `*` `/` `%`，字符串拼接 `~`
-- 字面量：字符串、数字、`true` `false` `null`、数组 `[1, 2]`、对象 `{"k": "v"}`
-- 优先级从高到低：管道与函数调用、`not`、算术、比较、`and`、`or`
+Used in value placeholders, `if` conditions, the right-hand side of `set`, and function arguments.
 
-与 `undefined` 的任何比较（包括 `!=`）都是 false。判断“有值”统一写 `notIsEmpty(x)`。
+- Logic: `and` / `&&`, `or` / `||`, `not` / `!` (the two spellings are equivalent)
+- Comparison: `==` `!=` `>` `>=` `<` `<=`
+- Arithmetic: `+` `-` `*` `/` `%`; string concatenation: `~`
+- Literals: `"abc"` / `'abc'`, `100`, `1.5`, `true`, `false`, `null`, arrays `[1, 2]`, objects `{"k": "v"}`
+- Precedence, highest first: pipes and function calls, `not`, arithmetic, comparison, `and`, `or`; use parentheses to override
 
-### 条件与循环
+Evaluation rules:
+
+- Any comparison with `undefined`, including `!=`, is false. So `$.request.body.id > 0` is simply false when the field is missing.
+- Operands of `if`, `and`, `or` and `not` must be booleans, otherwise it is an error; `undefined` counts as false.
+- A number and a numeric string compare by value (`"5" == 5` is true).
+- To test "has a value", write `notIsEmpty(x)` rather than `x != ""`.
+
+### Conditions
 
 ```
-{{if 表达式}} ... {{elseif 表达式}} ... {{else}} ... {{/if}}
+{{if expr}}
+  ...
+{{elseif expr}}
+  ...
+{{else}}
+  ...
+{{/if}}
+```
 
+Only the first matching branch is emitted. Expressions in skipped branches are not evaluated, so an `undefined` there is not an error. Conditions can be nested.
+
+### Loops
+
+```
 {{for v in $.request.body.users sep "or"}}
   (user_id = {{$v.user_id}} and type = {{$v.type}})
 {{/for}}
 ```
 
-`for` 的每一项去掉首尾空白后用 ` sep ` 连接，上例输出 `(user_id = ? and type = ?) or (user_id = ? and type = ?)`。`sep` 只接受字符串字面量。空数组输出为空，被遍历的值不是数组时报错。
-
-### 校验
+Output:
 
 ```
-{{validate $.request.body.users rule="required|array|max:100" message="用户列表必填，最多100个"}}
+(user_id = ? and type = ?) or (user_id = ? and type = ?)
+```
+
+- Each item is trimmed and the items are joined with ` sep `. `sep` is optional; without it items are joined with a single space.
+- `sep` must be a string literal.
+- The loop variable is referenced as `$v` and is not visible outside the loop.
+- An empty array emits nothing. Looping over a non-array (including `undefined`) is an error.
+- Loops can be nested and can contain `if`.
+
+### Validation
+
+```
+{{validate $.request.body.name rule="required|string|max:100" message="name is required"}}
+{{validate $.request.body.users rule="required|array|max:100" message="1 to 100 users required"}}
 {{validate $.request.body.users[*].type rule="in:1,2,3" message=t("bad_type")}}
 ```
 
-- 规则：`required` `string` `int` `numeric` `bool` `array` `date` `min:n` `max:n` `between:a,b` `in:a,b,c` `regex:模式`
-- 所有 `validate` 在渲染 SQL 之前执行，失败后不停止，全部失败项一次返回
-- 每项含 `field`（完整 JSONPath，`[*]` 替换为具体下标）、`rule`、`message`
-- 值为未定义、null 或空字符串时，除 `required` 外的规则都跳过
-- `[*]` 按父数组下标展开，元素缺少该字段时 `required` 能检出
-- `validate` 只能写在顶层；`regex` 的模式里可能有 `|`，必须写在规则链最后
+Rules follow the Laravel validator format: rules are separated by `|` and arguments follow a `:`.
 
-### 变量与多语言
+| Rule | Meaning |
+| --- | --- |
+| `required` | The field must exist and not be empty (as defined by `isEmpty`) |
+| `string` `int` `numeric` `bool` `array` `date` | Type checks; `int` and `numeric` accept numeric strings |
+| `min:n` `max:n` `between:a,b` | Character count for strings, value for numbers, element count for arrays |
+| `in:a,b,c` | The value must be in the list |
+| `regex:pattern` | Must match the pattern. A pattern may contain a vertical bar, so `regex` must be the last rule |
+
+Details:
+
+- When the value is undefined, null or an empty string, every rule except `required` is skipped.
+- One `validate` tag reports at most one error per value: the first rule in the chain that fails. To show different messages for different rules, write several `validate` tags for the same field.
+- `[*]` in the path is expanded by the index of the parent array and each element is validated separately; `required` detects an element that lacks the field.
+- A `validate` path supports members, indexes and `[*]` only, and `validate` must be at the top level of the template.
+- `message` is an expression: a string or `t("key")`. A default message is used when it is omitted.
+
+When validation fails, `Exec` returns `drusql.ValidationErrors`, which serializes to:
+
+```json
+{
+  "errors": [
+    { "field": "$.request.body.name", "rule": "required", "message": "name is required" },
+    { "field": "$.request.body.users[1].type", "rule": "in", "message": "invalid user type" }
+  ]
+}
+```
+
+`field` is the full JSONPath of the failing value with `[*]` replaced by the actual index, so a front end can locate the input, or the row in a list.
+
+### Variables
+
+```
+{{set $.page = $.request.body.page|default(1)|int}}
+{{set $.offset = ($.page - 1) * 20}}
+```
+
+- `set` has one form, `path = expression`, and emits no SQL. Use the `default` function for default values.
+- `$.request` is read-only; assigning to it is a parse error.
+- Missing intermediate levels are created automatically.
+- A `set` inside a loop only takes effect inside that loop.
+
+### Localization
+
+Messages live under `$.lang.data.<language>.<key>`, the current language under `$.lang.current`, and `t("key")` looks a message up:
 
 ```
 {{set $.lang.current = $.request.header.lang|default("en")}}
-{{set $.lang.data.en.name = "name not found"}}
-{{set $.lang.data.zh.name = "名称不存在"}}
-{{validate $.request.body.name rule="required" message=t("name")}}
+{{set $.lang.data.en.name_required = "name is required"}}
+{{set $.lang.data.zh.name_required = "请填写名称"}}
+
+{{validate $.request.body.name rule="required" message=t("name_required")}}
 ```
 
-`$.request` 只读。`t(key)` 先查当前语言，找不到回退到 `$.lang.default`（未设置时为 `en`），仍找不到返回 key 本身。循环内的 `set` 只在循环内有效。
-
-### 注释与字面量花括号
+Everything can also go into a single `set` (note the three closing braces: one closes the object, two close the tag):
 
 ```
-{# 这是注释，不会输出 #}
-{{"{{"|raw}}      输出字面量 {{
+{{set $.lang = {
+  "current": $.request.header.lang|default("en"),
+  "default": "en",
+  "data": {
+    "en": {"name_required": "name is required"},
+    "zh": {"name_required": "请填写名称"}
+  }
+}}}
 ```
 
-## 书写约定
+`t(key)` looks up in this order:
 
-引擎不裁剪 SQL，以下由模板作者负责：
+1. `$.lang.data.<current language>.<key>`
+2. The fallback language: the one named by `$.lang.default`, or `en` if that is not set
+3. The key itself
 
-1. and 条件以 `where 1=1` 开头，每个可选条件自带 `and`
-2. or 分组以 `(1=0` 开头，每个可选条件自带 `or`
-3. `for` 整体包在括号里，外层用 `if notIsEmpty(...)` 判空
-4. `in ({{...|join(",")}})` 同样用 `if` 判空
-5. 循环和 `join` 用到的数组用 `validate ... rule="array|max:N"` 限制长度
-6. UPDATE / DELETE 的定位条件用 `validate` 设为必填，不要放在 `if` 里
+Messages can also be supplied from Go, so templates need no `set` at all:
 
-独占一行的 `if` / `for` / `set` / `validate` 标签和注释不会在输出里留下空行。
+```go
+data := drusql.Request(body, header)
+data["lang"] = map[string]any{
+	"current": "zh",
+	"data": map[string]any{
+		"en": map[string]any{"name_required": "name is required"},
+		"zh": map[string]any{"name_required": "请填写名称"},
+	},
+}
+res, err := tpl.Exec(data)
+```
 
-## 实现说明
-
-规范里几处未定的地方，目前按以下方式实现：
-
-- `if`、`and`、`or`、`not` 的操作数必须是布尔值，否则报错；`undefined` 视为 false
-- 数字与数字形式的字符串比较时按数值比较（`"5" == 5` 为真）
-- `trim` / `lower` / `upper` 遇到非字符串原样返回，多数函数对 `undefined` 和 `null` 原样透传
-- JSON 解码得到的整数值（`float64` 且无小数）绑定为 `int64`
-- 输入数据不会被修改；结构体按其 JSON 形式参与路径访问
-- 暂不支持 `loaddb`
-
-## 测试
+### Comments and literal braces
 
 ```
-go test -race ./...
+{# a comment; emits nothing #}
+{{"{{"|raw}}      emits a literal {{
 ```
+
+An `if` / `for` / `set` / `validate` tag or a comment that stands alone on its line leaves no blank line in the generated SQL.
+
+## Writing conventions
+
+The engine does not trim SQL. It removes no dangling `and` / `or` and adds no parentheses; what the template says is what you get. The template author follows these conventions.
+
+**1. Start `and` conditions with `where 1=1`**, and let every optional condition carry its own `and`:
+
+```
+where 1=1
+{{if notIsEmpty($.request.body.id)}} and id = {{$.request.body.id}} {{/if}}
+{{if notIsEmpty($.request.body.type)}} and type = {{$.request.body.type}} {{/if}}
+```
+
+**2. Start an `or` group with `(1=0`**, and let every optional condition carry its own `or`:
+
+```
+and (1=0
+  {{if notIsEmpty($.request.body.id)}} or id = {{$.request.body.id}} {{/if}}
+  {{if notIsEmpty($.request.body.id2)}} or id = {{$.request.body.id2}} {{/if}}
+)
+```
+
+When both conditions are missing the group is always false. If you want "no filter when both are missing", wrap the group in an outer `if`.
+
+**3. Wrap a `for` in parentheses and guard it with `if`.** Otherwise operator precedence goes wrong, and an empty array produces `and ()`:
+
+```
+{{if notIsEmpty($.request.body.users)}}
+  and ({{for v in $.request.body.users sep "or"}}
+    (user_id = {{$v.user_id}} and type = {{$v.type}})
+  {{/for}})
+{{/if}}
+```
+
+**4. Guard `in` lists with `if` too**, to avoid `in ()`:
+
+```
+{{if notIsEmpty($.request.body.ids)}}
+  and id in ({{$.request.body.ids|join(",")}})
+{{/if}}
+```
+
+**5. Limit the length of every array used by a loop or `join`.** Databases cap the number of parameters in one statement:
+
+```
+{{validate $.request.body.users rule="array|max:100" message="at most 100 users"}}
+```
+
+**6. Make the locating condition of an UPDATE / DELETE required with `validate`, and do not put it inside an `if`.** `where 1=1` is always valid SQL, so the engine cannot tell when every condition was skipped, and the statement would hit the whole table.
+
+## Recipes
+
+### Dynamic sorting and paging
+
+```
+{{validate $.request.body.page rule="int|min:1" message="page must be >= 1"}}
+{{validate $.request.body.size rule="int|between:1,100" message="size must be between 1 and 100"}}
+select id, name from users
+where 1=1
+order by {{$.request.body.sort|default("id")|ident("id,name,created_at")}} {{$.request.body.dir|default("desc")|lower|ident("asc,desc")}}
+limit {{$.request.body.size|default(20)|int}} offset {{($.request.body.page|default(1)|int - 1) * ($.request.body.size|default(20)|int)}}
+```
+
+Column names and sort directions cannot be bound, so they must be restricted with `ident`. Paging syntax differs between databases and is written by the template author for the target dialect, for example on SQL Server:
+
+```
+order by id offset {{($.request.body.page|default(1)|int - 1) * 20}} rows fetch next {{20}} rows only
+```
+
+### IN query from one column of an array
+
+```
+{{if notIsEmpty($.request.body.users[*].user_id)}}
+  and user_id in ({{$.request.body.users[*].user_id|join(",")}})
+{{/if}}
+```
+
+### Batch insert
+
+```
+{{validate $.request.body.users rule="required|array|between:1,100" message="1 to 100 users required"}}
+insert into user_tag (user_id, type) values
+{{for u in $.request.body.users sep ","}}
+  ({{$u.user_id}}, {{$u.type|default(1)}})
+{{/for}}
+```
+
+### Update
+
+```
+{{validate $.request.body.id rule="required|int|min:1" message="id is required"}}
+update users
+set name = {{$.request.body.name}}, updated_at = {{"now()"|raw}}
+where id = {{$.request.body.id}}
+```
+
+### Inside an HTTP handler
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	header := map[string]any{"lang": r.Header.Get("X-Lang")}
+
+	res, err := listUsers.Exec(drusql.Request(body, header))
+
+	var verrs drusql.ValidationErrors
+	switch {
+	case errors.As(err, &verrs):
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		json.NewEncoder(w).Encode(map[string]any{"errors": verrs})
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rows, err := db.QueryContext(r.Context(), res.SQL, res.Args...)
+	// ...
+}
+```
+
+## Error handling
+
+| Type | When | Examples |
+| --- | --- | --- |
+| `*drusql.ParseError` | During `Parse` | Unclosed tag, unknown function, non-literal `sep`, assignment to `$.request` |
+| `drusql.ValidationErrors` | During `Exec` / `Validate` | A `validate` tag failed |
+| `*drusql.ExecError` | During `Exec` | `undefined` reaching a value placeholder, an `ident` value outside the whitelist, `for` over a non-array, a failed type conversion |
+
+`ParseError` and `ExecError` carry `Line`, `Col` and `Msg`, pointing at the position in the template. No error ever produces SQL.
+
+```go
+_, err := eng.Parse("select {{$.request.body.id|nosuch}}")
+var pe *drusql.ParseError
+if errors.As(err, &pe) {
+	fmt.Println(pe.Line, pe.Col, pe.Msg) // 1 28 unknown function "nosuch"
+}
+```
+
+## Notes
+
+- Call `RegisterFunc` before `Parse`. A `Template` is immutable and can be executed from many goroutines at once.
+- Whole numbers decoded from JSON (a `float64` with no fraction) are bound as `int64`.
+- `{#` starts a comment and `{{` starts a tag. To emit either literally in SQL text, use the `{{"{{"|raw}}` form.
+- The engine does not check SQL syntax and does not know whether a statement reads or writes; protecting UPDATE / DELETE relies on `validate`.
+- Loading localized messages from a database (`loaddb`) is not supported yet.
 
 ## License
 
